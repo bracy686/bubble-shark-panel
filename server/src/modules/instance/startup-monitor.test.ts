@@ -11,6 +11,7 @@ import { buildHostResourceSnapshot } from '../../infra/container/memory-budget'
 import { closeDatabase, createGameInstance, deleteGameInstanceById, getGameInstanceById, initDatabase, updateGameInstanceRuntime } from '../../shared/db'
 import { instanceConsoleLogStore } from '../../shared/instance-runtime/console-log-store'
 import { runStartupMonitor } from './startup-monitor'
+import { createStartupProbeQuery } from './startup-probe-query'
 import {
   cancelStartupTask, changeStartupPhase, createStartupTask, currentStartupTask,
   enqueueStartupTask, getStartupSnapshot, persistStartupTask, releaseStartupTask,
@@ -75,6 +76,28 @@ it('单世界进程和就绪日志不替代本轮游戏查询，查询成功后�
   assert.equal(saved?.lastStartupReport?.master.state, 'ready')
   assert.equal(saved?.lastStartupReport?.caves.state, 'disabled')
   assert.ok(saved?.runtimeReadyAt)
+})
+
+it('真实探针的延迟就绪回包跨越单次等待窗口后仍启动成功，不清理世界', async (t) => {
+  const f = await fixture(t, 'delayed-startup-reply')
+  let attempts = 0
+  const timers: NodeJS.Timeout[] = []
+  t.mock.method(f.runtime, 'execStdin', async (_ref: ContainerRef, command: string) => {
+    const token = /BSPSTART:([a-f0-9-]{36})\|/.exec(command)![1]
+    const reply = (ready: boolean) => instanceConsoleLogStore.appendDockerLine(f.instance.id, `BSPSTART:${token}|${ready ? 1 : 0}|1|x`, 'master')
+    if (++attempts === 1) reply(false)
+    else if (attempts === 2) timers.push(setTimeout(() => reply(true), 50))
+    return { exitCode: 0, output: '' }
+  })
+  const probe = createStartupProbeQuery({ instanceId: f.instance.id, runtime: f.runtime, signal: f.task.controller.signal, responseWaitMs: 2 })
+  try {
+    await f.run({ probe: probe.query })
+    assert.equal(f.task.snapshot.status, 'success')
+    assert.equal(f.task.snapshot.master.lastProbe?.worldReady, true)
+    assert.equal(f.cleanup.mock.callCount(), 0)
+    assert.equal((await getGameInstanceById(f.instance.id))?.lastStartupReport?.status, 'success')
+  }
+  finally { probe.dispose(); timers.forEach(clearTimeout) }
 })
 
 it('双世界使用洞穴实际 ID 查询主世界连接表，连接确认前保持 connecting', async (t) => {

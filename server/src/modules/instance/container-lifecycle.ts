@@ -6,7 +6,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { randomUUID } from 'node:crypto'
-import { buildDstStartupProbe, parseDstStartupProbe } from '../../infra/game-adapter/dst/startup-probe'
+import { createStartupProbeQuery } from './startup-probe-query'
 import { resolveDstContainerResourceLimits } from '../../infra/container/dst-container-resources'
 import { DST_MEMORY_SLICE, sampleHostResources, sampleRuntimeResources } from '../../infra/container/memory-budget'
 import { emitPanelEvent } from '../notify/events'
@@ -1268,26 +1268,11 @@ export function isCurrentCavesStartGeneration(instanceId: string, generation: nu
   return (cavesStartGenerations.get(instanceId) ?? 0) === generation
 }
 
-/**
- * 用本次随机标记读取世界和分片连接状态，命令回显与旧轮响应不能作为证据。
- */
+/** 独立查询使用短生命周期；启动监控复用整个任务的订阅以保留延迟回包。 */
 export async function queryStartupShard(ref: ContainerRef, instanceId: string, shard: 'master' | 'caves', signal: AbortSignal, remoteShardId?: string) {
-  if (signal.aborted) return null
-  const token = randomUUID()
-  const afterId = instanceConsoleLogStore.listLogs(instanceId).at(-1)?.id ?? 0
-  const result = await getContainerRuntime().execStdin(ref, buildDstStartupProbe(token, remoteShardId))
-  if (result.exitCode !== 0 || signal.aborted) return null
-  const until = Date.now() + 1000
-  while (Date.now() < until && !signal.aborted) {
-    for (const line of instanceConsoleLogStore.listLogs(instanceId, afterId)) {
-      if (line.stream !== 'stdout' || line.shard !== shard) continue
-      const parsed = parseDstStartupProbe(line.text, token)
-      if (parsed) return parsed
-    }
-    try { await sleep(100, undefined, { signal }) }
-    catch { if (signal.aborted) return null; throw new Error('启动查询等待中断') }
-  }
-  return null
+  const probe = createStartupProbeQuery({ instanceId, runtime: getContainerRuntime(), signal })
+  try { return await probe.query(ref, shard, remoteShardId) }
+  finally { probe.dispose() }
 }
 
 export async function startCavesAfterMasterReady(
@@ -1311,32 +1296,36 @@ export async function startCavesAfterMasterReady(
   task.snapshot.settings ??= resolveInstanceResourceSettings()
   if (!input.task) await persistStartupTask(task)
   const runtime = getContainerRuntime()
-  await runStartupMonitor(app, {
-    ...input, task, runtime, waitSec: task.snapshot.settings.shardReadyWaitSec,
-    isCancelled: stale,
-    luaFailure: shard => findShardLuaFailure(input.instanceId, input.installPath, task.snapshot[shard ?? 'master'].startedAt ?? input.startedAt, shard),
-    probe: (ref, shard, remoteShardId) => queryStartupShard(ref, input.instanceId, shard, task.controller.signal, remoteShardId),
-    protectOom: async shard => {
-      const current = await getGameInstanceById(input.instanceId)
-      if (!current || stale() || !isCurrentStartupTask(task)) return
-      await protectInstanceMemory(app, current, { code: 'oom', message: shard === 'caves' ? '洞穴发生 OOM，已保护停止洞穴，主世界继续运行' : '主世界发生 OOM，已保护停止实例', master: task.snapshot.master.resources ?? null, caves: task.snapshot.caves.resources ?? null, host: await sampleHostResources(runtime) }, shard === 'caves' ? undefined : [input.masterRef], shard === 'caves' ? 'caves' : 'instance')
-    },
-    cleanup: async (refs) => {
-      if (stale() || !isCurrentStartupTask(task)) return
-      for (const ref of refs) {
-        const shard = ref.id === input.masterRef.id ? 'master' : 'caves'
-        ref.runtimeIdentity ??= task.snapshot[shard].resources?.runtimeIdentity ?? undefined
-        stopShardLogFollow(input.instanceId, shard)
-      }
-      const removed = await Promise.all(refs.map(ref => stopAndRemoveShard(runtime, ref, input.instanceId, () => stale() || !isCurrentStartupTask(task))))
-      if (removed.some(value => !value)) throw new Error('分片清理未完成，保留上一轮引用')
-      if (stale() || !isCurrentStartupTask(task)) return
-      const remaining = await Promise.all([runtime.findByName(buildMasterContainerName(input.instanceId)), runtime.findByName(buildCavesContainerName(input.instanceId))])
-      if (stale() || !isCurrentStartupTask(task)) return
-      if (remaining.every(ref => !ref)) await runtime.removeShardNetwork(input.instanceId)
-      for (const ref of refs) shardLogProbeCache.delete(input.instanceId + (ref.id === input.masterRef.id ? ':master' : ':caves'))
-    },
-  })
+  const probe = createStartupProbeQuery({ instanceId: input.instanceId, runtime, signal: task.controller.signal })
+  try {
+    await runStartupMonitor(app, {
+      ...input, task, runtime, waitSec: task.snapshot.settings.shardReadyWaitSec,
+      isCancelled: stale,
+      luaFailure: shard => findShardLuaFailure(input.instanceId, input.installPath, task.snapshot[shard ?? 'master'].startedAt ?? input.startedAt, shard),
+      probe: probe.query,
+      protectOom: async shard => {
+        const current = await getGameInstanceById(input.instanceId)
+        if (!current || stale() || !isCurrentStartupTask(task)) return
+        await protectInstanceMemory(app, current, { code: 'oom', message: shard === 'caves' ? '洞穴发生 OOM，已保护停止洞穴，主世界继续运行' : '主世界发生 OOM，已保护停止实例', master: task.snapshot.master.resources ?? null, caves: task.snapshot.caves.resources ?? null, host: await sampleHostResources(runtime) }, shard === 'caves' ? undefined : [input.masterRef], shard === 'caves' ? 'caves' : 'instance')
+      },
+      cleanup: async (refs) => {
+        if (stale() || !isCurrentStartupTask(task)) return
+        for (const ref of refs) {
+          const shard = ref.id === input.masterRef.id ? 'master' : 'caves'
+          ref.runtimeIdentity ??= task.snapshot[shard].resources?.runtimeIdentity ?? undefined
+          stopShardLogFollow(input.instanceId, shard)
+        }
+        const removed = await Promise.all(refs.map(ref => stopAndRemoveShard(runtime, ref, input.instanceId, () => stale() || !isCurrentStartupTask(task))))
+        if (removed.some(value => !value)) throw new Error('分片清理未完成，保留上一轮引用')
+        if (stale() || !isCurrentStartupTask(task)) return
+        const remaining = await Promise.all([runtime.findByName(buildMasterContainerName(input.instanceId)), runtime.findByName(buildCavesContainerName(input.instanceId))])
+        if (stale() || !isCurrentStartupTask(task)) return
+        if (remaining.every(ref => !ref)) await runtime.removeShardNetwork(input.instanceId)
+        for (const ref of refs) shardLogProbeCache.delete(input.instanceId + (ref.id === input.masterRef.id ? ':master' : ':caves'))
+      },
+    })
+  }
+  finally { probe.dispose() }
 }
 
 /** 运行期洞穴失败只清理该分片；保护锁与失败现场留在同一份报告中。 */

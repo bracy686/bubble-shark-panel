@@ -6,6 +6,19 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      publish_image:
+        description: 'Publish this branch as a GHCR image after quality checks'
+        type: boolean
+        default: false
+      export_archive:
+        description: 'Also upload an offline Docker image archive'
+        type: boolean
+        default: false
+      steamcmd_sha256:
+        description: 'SHA256 of the official SteamCMD Linux installer archive'
+        type: string
+        default: 'cebf0046bfd08cf45da6bc094ae47aa39ebf4155e5ede41373b579b8f1071e7c'
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -49,3 +62,103 @@ jobs:
             printf 'Untracked generated migrations:\n%s\n' "$untracked" >&2
             exit 1
           fi
+
+  branch-image:
+    name: Build branch image
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_image
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout selected branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve immutable image reference
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          image="ghcr.io/${owner}/bubblesharkpanel:branch-${GITHUB_SHA}"
+          version="$(node -p "require('./package.json').version")-branch.${GITHUB_SHA:0:12}"
+          echo "reference=${image}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Require pinned SteamCMD checksum
+        shell: bash
+        env:
+          STEAMCMD_ARCHIVE_SHA256: ${{ inputs.steamcmd_sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${STEAMCMD_ARCHIVE_SHA256}" =~ ^[a-f0-9]{64}$ ]]; then
+            echo "::error::Provide a valid SteamCMD archive SHA256 before publishing."
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish selected commit
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: docker/unified/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.image.outputs.reference }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha,scope=branch-unified
+          cache-to: type=gha,mode=max,scope=branch-unified
+          provenance: mode=max
+          sbom: true
+          build-args: |
+            BSP_RELEASE_VERSION=${{ steps.image.outputs.version }}
+            BSP_BUILD_SHA=${{ github.sha }}
+            STEAMCMD_ARCHIVE_SHA256=${{ inputs.steamcmd_sha256 }}
+
+      - name: Record image digest
+        shell: bash
+        env:
+          IMAGE_REFERENCE: ${{ steps.image.outputs.reference }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          printf '{"reference":"%s","digest":"%s","commit":"%s"}\n' \
+            "$IMAGE_REFERENCE" "$IMAGE_DIGEST" "$GITHUB_SHA" > branch-image.json
+          echo "### Branch image" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: \`${IMAGE_REFERENCE}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Digest: \`${IMAGE_DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Export offline image
+        if: inputs.export_archive
+        shell: bash
+        env:
+          IMAGE_REFERENCE: ${{ steps.image.outputs.reference }}
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE_REFERENCE"
+          docker save "$IMAGE_REFERENCE" | gzip > bubblesharkpanel-branch-image.tar.gz
+          sha256sum bubblesharkpanel-branch-image.tar.gz > bubblesharkpanel-branch-image.tar.gz.sha256
+
+      - name: Upload build metadata and optional image archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: branch-image-${{ github.sha }}
+          path: |
+            branch-image.json
+            bubblesharkpanel-branch-image.tar.gz
+            bubblesharkpanel-branch-image.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
